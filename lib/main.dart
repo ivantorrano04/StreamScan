@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui';
 // dart:io removed to avoid unresolved symbol on some platforms
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -962,53 +963,84 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
   }
 
   Future<void> _setup() async {
+    // 1. Determinar la URL y el tipo de stream
     if (widget.raw) {
-      _videoUrl = _ensureHttp(widget.camera.url);
+      _videoUrl = _ensureHttpSafe(widget.camera.url);
       _useMjpegHtml = false;
       _useFallback = true;
-      // don't attempt auth probing when raw mode
+      // En modo raw no probamos autenticación
     } else {
       await _determineStreamType();
 
       if (isLocked) {
-        setState(() {});
+        if (mounted) setState(() {});
         return;
       }
     }
-    _webController = WebViewController()..setJavaScriptMode(JavaScriptMode.unrestricted);
-    _webController.setUserAgent("Mozilla/5.0 (Linux; Android 11; Redmi K20 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36");
 
-    // Always set a navigation delegate that injects cleaner JS on finished pages
-    _webController.setNavigationDelegate(NavigationDelegate(
-      onPageStarted: (url) { _onPageStarted(); },
-      onPageFinished: (url) async { await _injectCleaner(); _onPageFinished(); },
-      onWebResourceError: (err) { setState(()=> _pageLoading = false); },
-    ));
+    // 2. Inicializar el controlador del WebView
+    _webController = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted);
 
-    if (_useMjpegHtml) {
-      final html = '''
-  <html>
-    <body style="margin:0;padding:0;background:black;display:flex;justify-content:center;align-items:center;">
-      <img src="$_videoUrl" onerror="this.src=this.src;" style="width:100vw;height:100vh;object-fit:fill;">
-    </body>
-  </html>
-''';
-      debugPrint('Loading MJPEG (HTML): $_videoUrl');
-      _onPageStarted();
-      await _webController.loadHtmlString(html, baseUrl: _ensureHttp(widget.camera.url));
-      _onPageFinished();
-      setState((){ _controllerInitialized = true; _streamLabel = 'MJPEG'; });
-    } else if (_useFallback) {
-      final target = _videoUrl.isNotEmpty ? _videoUrl : _ensureHttp(widget.camera.url);
-      debugPrint('Loading web UI: $target');
-      _onPageStarted();
-      await _webController.loadRequest(Uri.parse(target));
-      _onPageFinished();
-      setState((){ _controllerInitialized = true; _streamLabel = 'Web UI'; });
+    // 3. Configurar User Agent inteligente según la plataforma
+    try {
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        // User Agent de Safari en iPhone para saltar bloqueos de Apple
+        _webController.setUserAgent(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1");
+      } else if (defaultTargetPlatform == TargetPlatform.android) {
+        // User Agent de Chrome en Android (tu Redmi K20 Pro)
+        _webController.setUserAgent(
+            "Mozilla/5.0 (Linux; Android 11; Redmi K20 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36");
+      } else {
+        // User Agent genérico para otros sistemas
+        _webController.setUserAgent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36");
+      }
+    } catch (e) {
+      debugPrint("Error configurando UserAgent: $e");
     }
 
-    _startHideTimer();
-    setState(() {});
+    // 4. Único NavigationDelegate (Fusión de logs de error + limpieza de JS)
+    _webController.setNavigationDelegate(NavigationDelegate(
+      onPageStarted: (url) {
+        _onPageStarted();
+      },
+      onPageFinished: (url) async {
+        // Inyectamos el limpiador de CSS/JS para quitar menús de la cámara
+        await _injectCleaner();
+        _onPageFinished();
+      },
+      onWebResourceError: (WebResourceError error) {
+        // LOG CRÍTICO: Aquí verás en la consola de Codemagic por qué falla en iPhone
+        debugPrint("❌ Error WebView: ${error.description} | Código: ${error.errorCode} | URL: ${error.url}");
+        
+        if (mounted) {
+          setState(() => _pageLoading = false);
+        }
+      },
+    ));
+
+    // 5. Cargar el contenido (HTML para MJPEG o URL directa)
+    if (_useMjpegHtml) {
+      final html = '''
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        </head>
+        <body style="margin:0;padding:0;background:black;display:flex;justify-content:center;align-items:center;">
+          <img src="$_videoUrl" 
+               onerror="this.src=this.src;" 
+               style="width:100vw;height:100vh;object-fit:contain;">
+        </body>
+      </html>
+      ''';
+      _webController.loadHtmlString(html);
+    } else {
+      _webController.loadRequest(Uri.parse(_videoUrl));
+    }
+
+    if (mounted) setState(() {});
   }
 
   void _startHideTimer([int seconds = 4]){
@@ -1052,7 +1084,7 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
                 onPressed: () async {
                   Navigator.of(ctx).pop();
                   try {
-                    final raw = _ensureHttp(widget.camera.url);
+                    final raw = _ensureHttpSafe(widget.camera.url);
                     setState(()=> _pageLoading = true);
                     await _webController.loadRequest(Uri.parse(raw));
                   } catch (_) {}
@@ -1072,7 +1104,7 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
   }
 
   Future<void> _determineStreamType() async {
-    final base = _ensureHttp(widget.camera.url.trim());
+    final base = _ensureHttpSafe(widget.camera.url.trim());
     // Try to load credentials from model or secure storage
     if ((widget.camera.authUser == null || widget.camera.authPass == null)) {
       final key = _storageKeyForCamera(base);
@@ -1096,6 +1128,14 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
     final List<String> candidates = [];
 
     void addAll(List<String> items){ for(var s in items) if(!candidates.contains(s)) candidates.add(s); }
+
+    // Prioritize known good routes before brand-specific heuristics
+    addAll([
+      '/viewer/live/es/live.html',
+      '/viewer/live/en/fullscreen.html',
+      '/mjpg/video.mjpg',
+      '/live/index.html',
+    ]);
 
     // Brand-specific hints
     if (model.contains('axis') || org.contains('axis')) {
@@ -1346,6 +1386,33 @@ if(imgs && imgs.length>0){
     return '$pref/mjpg/video.mjpg';
   }
 
+  // A safer URL normalizer used by the player logic to avoid malformed URLs
+  // on iOS/WebView. This is preferred inside CameraPlayerScreen.
+  String _ensureHttpSafe(String url) {
+    var s = url.trim();
+    if (s.isEmpty) return s;
+    // Remove whitespace
+    s = s.replaceAll(RegExp(r'\s+'), '');
+
+    // Normalize repeated scheme prefixes to a single one
+    final schemeMatch = RegExp(r'^(?:https?:\/\/)+', caseSensitive: false).firstMatch(s);
+    if (schemeMatch != null) {
+      final wantsHttps = s.toLowerCase().startsWith('https://');
+      final scheme = wantsHttps ? 'https://' : 'http://';
+      s = s.replaceFirst(RegExp(r'^(?:https?:\/\/)+', caseSensitive: false), scheme);
+    }
+
+    // Ensure scheme
+    if (!s.toLowerCase().startsWith('http://') && !s.toLowerCase().startsWith('https://')) {
+      s = 'http://$s';
+    }
+
+    // Trim trailing slashes
+    s = s.replaceAll(RegExp(r'\/+\s*\z'), '');
+
+    return s;
+  }
+
   void _moveUp() async {
     _sendPtzCommand('up');
     await _runJs('if(typeof moveUp=="function") moveUp(); else if(document.querySelector(".ptz-up")) document.querySelector(".ptz-up").click();');
@@ -1368,7 +1435,7 @@ if(imgs && imgs.length>0){
 
   Future<void> _sendPtzCommand(String dir) async {
     try {
-      final src = _ensureHttp(widget.camera.url.trim());
+      final src = _ensureHttpSafe(widget.camera.url.trim());
       final u = Uri.parse(src);
       final scheme = u.scheme.isEmpty ? 'http' : u.scheme;
       final host = u.host;
@@ -1382,7 +1449,7 @@ if(imgs && imgs.length>0){
 
   Future<void> _attemptLogin(String user, String pass) async {
     try {
-      final base = _ensureHttp(widget.camera.url.trim());
+      final base = _ensureHttpSafe(widget.camera.url.trim());
       final u = Uri.parse(base);
       final scheme = u.scheme.isEmpty ? 'http' : u.scheme;
       final host = u.host.isNotEmpty ? u.host : (u.pathSegments.isNotEmpty ? u.pathSegments[0] : '');
@@ -1398,7 +1465,7 @@ if(imgs && imgs.length>0){
         widget.camera.requiresAuth = false;
         isLocked = false;
         // persist securely
-        final key = _storageKeyForCamera(_ensureHttp(widget.camera.url));
+        final key = _storageKeyForCamera(_ensureHttpSafe(widget.camera.url));
         try { await _secureStorage.write(key: key, value: '$user:$pass'); } catch (_) {}
         _videoUrl = authUri.toString();
         _useMjpegHtml = true;
