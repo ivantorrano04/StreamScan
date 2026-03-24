@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:ui';
-import 'dart:typed_data';
 // dart:io removed to avoid unresolved symbol on some platforms
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -10,6 +9,8 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:flutter_map_marker_cluster/flutter_map_marker_cluster.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_mjpeg/flutter_mjpeg.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
@@ -106,101 +107,95 @@ class _MyAppState extends State<MyApp> {
       debugShowCheckedModeBanner: false,
     );
   }
+
+  
 }
 
-// Simple MJPEG stream widget: reads multipart JPEG stream and displays frames
-class MJpegWidget extends StatefulWidget {
+// Top-level native fallback widget (replaces MyApp-local helper)
+class NativeFallbackWidget extends StatelessWidget {
+  final String url;
+  const NativeFallbackWidget({super.key, required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    final lower = url.toLowerCase();
+    final isImage = lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.contains('snapshot') || lower.contains('image');
+
+    if (isImage) {
+      return Center(child: Image.network(url, fit: BoxFit.contain));
+    }
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.public, size: 48, color: Colors.white70),
+          const SizedBox(height: 8),
+          const Text('Vista web no soportada internamente', style: TextStyle(color: Colors.white70)),
+          const SizedBox(height: 12),
+          ElevatedButton(
+            onPressed: () async {
+              try {
+                final uri = Uri.parse(url);
+                if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se pudo abrir el navegador')));
+                }
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+              }
+            },
+            child: const Text('Abrir en navegador'),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// MJPEG widget using `flutter_mjpeg` package (renders native MJPEG stream)
+class MJpegWidget extends StatelessWidget {
   final String url;
   final String? user;
   final String? pass;
   const MJpegWidget({super.key, required this.url, this.user, this.pass});
 
   @override
-  State<MJpegWidget> createState() => _MJpegWidgetState();
-}
-
-class _MJpegWidgetState extends State<MJpegWidget> {
-  http.Client? _client;
-  Image? _current;
-  StreamSubscription<List<int>>? _sub;
-  final _buffer = BytesBuilder();
-  bool _running = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _startStream();
-  }
-
-  Future<void> _startStream() async {
-    try {
-      _client = http.Client();
-      final uri = Uri.parse(widget.url);
-      final req = http.Request('GET', uri);
-      if (widget.user != null && widget.pass != null) {
-        final cred = base64.encode(utf8.encode('${widget.user}:${widget.pass}'));
-        req.headers['Authorization'] = 'Basic $cred';
-      }
-      req.headers['User-Agent'] = 'Mozilla/5.0';
-      final streamed = await _client!.send(req).timeout(const Duration(seconds: 8));
-      _running = true;
-      _sub = streamed.stream.listen(_onData, onError: _onError, onDone: _onDone, cancelOnError: true);
-    } catch (e) {
-      if (mounted) setState((){});
-    }
-  }
-
-  void _onData(List<int> chunk) {
-    try {
-      _buffer.add(chunk);
-      final bytes = _buffer.toBytes();
-      // Find JPEG start/end
-      final start = _indexOf(bytes, <int>[0xFF, 0xD8]);
-      final end = _indexOf(bytes, <int>[0xFF, 0xD9], start != -1 ? start + 2 : 0);
-      if (start != -1 && end != -1 && end > start) {
-        final frame = bytes.sublist(start, end + 2);
-        _buffer.clear();
-        if (mounted) {
-          setState(() {
-            _current = Image.memory(Uint8List.fromList(frame), fit: BoxFit.contain);
-          });
-        }
-      }
-    } catch (_) {}
-  }
-
-  int _indexOf(Uint8List data, List<int> pattern, [int from = 0]) {
-    for (var i = from; i <= data.length - pattern.length; i++) {
-      var ok = true;
-      for (var j = 0; j < pattern.length; j++) {
-        if (data[i + j] != pattern[j]) { ok = false; break; }
-      }
-      if (ok) return i;
-    }
-    return -1;
-  }
-
-  void _onError(Object e) {
-    if (mounted) setState(() {});
-  }
-
-  void _onDone() {
-    _running = false;
-    if (mounted) setState(() {});
-  }
-
-  @override
-  void dispose() {
-    _sub?.cancel();
-    _client?.close();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    if (_current != null) return FittedBox(fit: BoxFit.contain, child: SizedBox(width: MediaQuery.of(context).size.width, height: MediaQuery.of(context).size.height, child: _current));
-    if (!_running) return const Center(child: Text('No MJPEG stream', style: TextStyle(color: Colors.white70)));
-    return const Center(child: CircularProgressIndicator());
+    // Build headers if basic auth provided
+    final headers = <String, String>{};
+    if (user != null && pass != null) {
+      final cred = base64.encode(utf8.encode('${user!}:${pass!}'));
+      headers['Authorization'] = 'Basic $cred';
+    }
+
+    return Mjpeg(
+      stream: url,
+      isLive: true,
+      // Error builder: show icon + button to open in external browser
+      error: (context, error, stack) {
+        return Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.error_outline, size: 64, color: Colors.redAccent),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: () async {
+                try {
+                  final uri = Uri.parse(url);
+                  if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se pudo abrir el navegador')));
+                  }
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+                }
+              },
+              child: const Text('Abrir en navegador'),
+            ),
+          ]),
+        );
+      },
+      headers: headers,
+      fit: BoxFit.contain,
+    );
   }
 }
 
@@ -1034,6 +1029,7 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
   bool isLocked = false;
   bool _useMjpegHtml = false;
   bool _useFallback = false;
+  bool _webviewFailed = false;
   // Debug overlay
   final List<String> _debugLogs = [];
   bool _showDebugOverlay = true;
@@ -1074,6 +1070,7 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
 
   Future<void> _setup() async {
     _addDebug('>> _setup START');
+    _webviewFailed = false;
 
     // 1. Determinar la URL y el tipo de stream
     if (widget.raw) {
@@ -1152,9 +1149,17 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
         }
         debugPrint("❌ Error WebView: $descr | Código: $code | URL: $url");
         _addDebug('WebView ERROR: $descr | code=$code | url=$url');
-        
+        // Mark webview as failed so UI switches to native fallback
         if (mounted) {
-          setState(() => _pageLoading = false);
+          setState(() {
+            _pageLoading = false;
+            _useFallback = true;
+            _useMjpegHtml = false;
+            _controllerInitialized = true;
+            _webviewFailed = true;
+            widget.camera.useFullWeb = true;
+          });
+          _addDebug('WebView failed -> will show NativeFallbackWidget');
         }
       },
     ));
@@ -1360,14 +1365,37 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
         }
 
         if (code == 200) {
-          // direct MJPEG indicated by content-type or by filename
-          if (contentType.contains('multipart/x-mixed-replace') || probeUrl.toLowerCase().endsWith('.mjpg') || probeUrl.toLowerCase().endsWith('.mjpeg') || probeUrl.toLowerCase().contains('mjpg') || probeUrl.toLowerCase().contains('mjpeg') || probeUrl.toLowerCase().contains('video.cgi') || probeUrl.toLowerCase().contains('axis-cgi')) {
+          // Conservative MJPEG detection:
+          // - Prefer content-type 'multipart/x-mixed-replace' OR explicit image/*
+          // - If path ends with .mjpg/.mjpeg only accept when header suggests image/multipart
+          bool looksLikeMjpeg = false;
+          final bytes = resp.bodyBytes;
+
+          if (contentType.contains('multipart/x-mixed-replace')) {
+            looksLikeMjpeg = true;
+            _addDebug('probe hint: content-type is multipart');
+          } else if (contentType.startsWith('image/')) {
+            // single JPEG snapshot or MJPEG served with image/* header
+            // treat as snapshot (fallback to native image viewer)
+            _addDebug('probe hint: content-type is image/* -> will use native image fallback');
+            _useMjpegHtml = false;
+            _useFallback = true;
+            _videoUrl = probeUrl;
+            return;
+          } else if (probeUrl.toLowerCase().endsWith('.mjpg') || probeUrl.toLowerCase().endsWith('.mjpeg')) {
+            // only accept .mjpg when headers or initial bytes look like MJPEG
+            if (contentType.contains('multipart') || (bytes.length > 4 && bytes.contains(0xFF) && bytes.contains(0xD8))) {
+              looksLikeMjpeg = true;
+              _addDebug('probe hint: .mjpg URL with matching headers/bytes');
+            }
+          }
+
+          if (looksLikeMjpeg) {
             _useMjpegHtml = true;
             _useFallback = false;
             isLocked = false;
             widget.camera.requiresAuth = false;
             widget.camera.useFullWeb = false;
-            // clear stored creds if any
             try { await _secureStorage.delete(key: _storageKeyForCamera(base)); } catch (_) {}
             return;
           }
@@ -1832,13 +1860,48 @@ if(imgs && imgs.length>0){
                 child: MJpegWidget(url: _videoUrl, user: widget.camera.authUser, pass: widget.camera.authPass),
               ),
             )
-          else
-            // Fullscreen webview with tap-to-toggle controls
+          else if (_webviewFailed)
             Positioned.fill(
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: _toggleControls,
-                child: WebViewWidget(controller: _webController),
+                child: NativeFallbackWidget(url: _videoUrl),
+              ),
+            )
+          else
+            // Fullscreen webview with tap-to-toggle controls (show in-app WebView, keep external fallback button available)
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleControls,
+                child: Stack(children: [
+                  // Render the WebView controller content
+                  WebViewWidget(controller: _webController),
+                  // Small floating fallback button if user prefers external browser
+                  Positioned(
+                    bottom: 18,
+                    right: 18,
+                    child: AnimatedOpacity(
+                      duration: const Duration(milliseconds: 220),
+                      opacity: _controlsVisible ? 1.0 : 0.0,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.black54),
+                        onPressed: () async {
+                          try {
+                            final uri = Uri.parse(_videoUrl);
+                            if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+                              if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se pudo abrir el navegador')));
+                            }
+                          } catch (e) {
+                            if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+                          }
+                        },
+                        icon: const Icon(Icons.open_in_browser),
+                        label: const Text('Abrir en navegador'),
+                      ),
+                    ),
+                  ),
+                ]),
               ),
             ),
 
