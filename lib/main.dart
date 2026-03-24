@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ui';
+import 'dart:typed_data';
 // dart:io removed to avoid unresolved symbol on some platforms
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -104,6 +105,102 @@ class _MyAppState extends State<MyApp> {
       home: MainDashboard(onToggleTheme: _toggleTheme, themeMode: _themeMode),
       debugShowCheckedModeBanner: false,
     );
+  }
+}
+
+// Simple MJPEG stream widget: reads multipart JPEG stream and displays frames
+class MJpegWidget extends StatefulWidget {
+  final String url;
+  final String? user;
+  final String? pass;
+  const MJpegWidget({super.key, required this.url, this.user, this.pass});
+
+  @override
+  State<MJpegWidget> createState() => _MJpegWidgetState();
+}
+
+class _MJpegWidgetState extends State<MJpegWidget> {
+  http.Client? _client;
+  Image? _current;
+  StreamSubscription<List<int>>? _sub;
+  final _buffer = BytesBuilder();
+  bool _running = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _startStream();
+  }
+
+  Future<void> _startStream() async {
+    try {
+      _client = http.Client();
+      final uri = Uri.parse(widget.url);
+      final req = http.Request('GET', uri);
+      if (widget.user != null && widget.pass != null) {
+        final cred = base64.encode(utf8.encode('${widget.user}:${widget.pass}'));
+        req.headers['Authorization'] = 'Basic $cred';
+      }
+      req.headers['User-Agent'] = 'Mozilla/5.0';
+      final streamed = await _client!.send(req).timeout(const Duration(seconds: 8));
+      _running = true;
+      _sub = streamed.stream.listen(_onData, onError: _onError, onDone: _onDone, cancelOnError: true);
+    } catch (e) {
+      if (mounted) setState((){});
+    }
+  }
+
+  void _onData(List<int> chunk) {
+    try {
+      _buffer.add(chunk);
+      final bytes = _buffer.toBytes();
+      // Find JPEG start/end
+      final start = _indexOf(bytes, <int>[0xFF, 0xD8]);
+      final end = _indexOf(bytes, <int>[0xFF, 0xD9], start != -1 ? start + 2 : 0);
+      if (start != -1 && end != -1 && end > start) {
+        final frame = bytes.sublist(start, end + 2);
+        _buffer.clear();
+        if (mounted) {
+          setState(() {
+            _current = Image.memory(Uint8List.fromList(frame), fit: BoxFit.contain);
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  int _indexOf(Uint8List data, List<int> pattern, [int from = 0]) {
+    for (var i = from; i <= data.length - pattern.length; i++) {
+      var ok = true;
+      for (var j = 0; j < pattern.length; j++) {
+        if (data[i + j] != pattern[j]) { ok = false; break; }
+      }
+      if (ok) return i;
+    }
+    return -1;
+  }
+
+  void _onError(Object e) {
+    if (mounted) setState(() {});
+  }
+
+  void _onDone() {
+    _running = false;
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    _client?.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_current != null) return FittedBox(fit: BoxFit.contain, child: SizedBox(width: MediaQuery.of(context).size.width, height: MediaQuery.of(context).size.height, child: _current));
+    if (!_running) return const Center(child: Text('No MJPEG stream', style: TextStyle(color: Colors.white70)));
+    return const Center(child: CircularProgressIndicator());
   }
 }
 
@@ -1035,6 +1132,12 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
         _addDebug('onPageFinished: ${url ?? ''}');
         // Inyectamos el limpiador de CSS/JS para quitar menús de la cámara
         await _injectCleaner();
+        try {
+          await _enableZoomAndScroll();
+          _addDebug('enableZoomAndScroll executed');
+        } catch (e) {
+          _addDebug('enableZoomAndScroll failed: $e');
+        }
         _onPageFinished();
       },
       onWebResourceError: (WebResourceError error) {
@@ -1071,9 +1174,15 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
       </html>
       ''';
       _addDebug('loading MJPEG HTML with $_videoUrl');
-      _webController.loadHtmlString(html);
+      // For MJPEG streams, prefer native MJPEG parser widget to avoid WebView ORB blocking
+      _controllerInitialized = true;
+      _videoUrl = _ensureHttpSafe(_videoUrl);
+      // store html in _videoUrl? we will use _useMjpegHtml flag in build to show MJPEG widget
     } else {
       _addDebug('loading URL request: $_videoUrl');
+      _videoUrl = _ensureHttpSafe(_videoUrl);
+      // mark controller as initialized so build shows the WebView, not the spinner
+      _controllerInitialized = true;
       _webController.loadRequest(Uri.parse(_videoUrl));
     }
 
@@ -1397,6 +1506,53 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
     await _runJs(shim);
   }
 
+  Future<void> _enableZoomAndScroll() async {
+    const js = r"""
+(function(){
+  try {
+    var mv = document.querySelector('meta[name=viewport]');
+    if(!mv){
+      mv = document.createElement('meta');
+      mv.name = 'viewport';
+      document.head.appendChild(mv);
+    }
+    mv.content = 'width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=1';
+
+    document.documentElement.style.overflow = 'auto';
+    document.body.style.overflow = 'auto';
+    try { document.body.style.webkitOverflowScrolling = 'touch'; } catch(e) {}
+
+    // Force touch-action and pointer settings on all elements so sites that disable gestures stop doing that
+    try {
+      var all = Array.from(document.getElementsByTagName('*'));
+      for(var i=0;i<all.length;i++){
+        try{
+          all[i].style.touchAction = 'auto';
+          all[i].style['-webkit-user-select'] = 'auto';
+          all[i].style['-webkit-touch-callout'] = 'default';
+          all[i].style['-ms-touch-action'] = 'auto';
+        }catch(e){}
+      }
+    } catch(e){}
+
+    // Remove blocking touch event handlers by overriding addEventListener to allow passive listeners
+    try {
+      var origAdd = EventTarget.prototype.addEventListener;
+      EventTarget.prototype.addEventListener = function(type, listener, options){
+        if(type === 'touchstart' || type === 'touchmove' || type === 'touchend' || type === 'gesturestart' || type === 'gesturechange' || type === 'gestureend'){
+          try{ return origAdd.call(this, type, listener, {passive:true}); }catch(e){}
+        }
+        return origAdd.call(this, type, listener, options);
+      };
+    } catch(e){}
+
+    return true;
+  } catch(e){ return false; }
+})();
+""";
+    await _runJs(js);
+  }
+
   Future<void> _applyImageCss() async {
     const css = r"""
 document.body.style.margin = '0';
@@ -1476,6 +1632,7 @@ if(imgs && imgs.length>0){
     _sendPtzCommand('right');
     await _runJs('if(typeof moveRight=="function") moveRight(); else if(document.querySelector(".ptz-right")) document.querySelector(".ptz-right").click();');
   }
+
 
   Future<void> _sendPtzCommand(String dir) async {
     try {
@@ -1666,6 +1823,15 @@ if(imgs && imgs.length>0){
             )
           else if (!_controllerInitialized)
             const Positioned.fill(child: Center(child: CircularProgressIndicator()))
+          else if (_useMjpegHtml)
+            // MJPEG native viewer (avoids WebView ORB blocking)
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleControls,
+                child: MJpegWidget(url: _videoUrl, user: widget.camera.authUser, pass: widget.camera.authPass),
+              ),
+            )
           else
             // Fullscreen webview with tap-to-toggle controls
             Positioned.fill(
