@@ -937,6 +937,9 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
   bool isLocked = false;
   bool _useMjpegHtml = false;
   bool _useFallback = false;
+  // Debug overlay
+  final List<String> _debugLogs = [];
+  bool _showDebugOverlay = true;
   String _videoUrl = '';
   bool _controllerInitialized = false;
   bool _controlsVisible = true;
@@ -949,6 +952,16 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
   final TextEditingController _authUserController = TextEditingController();
   final TextEditingController _authPassController = TextEditingController();
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+
+  void _addDebug(String msg) {
+    try {
+      final ts = DateTime.now().toIso8601String();
+      _debugLogs.insert(0, '[$ts] $msg');
+      if (_debugLogs.length > 200) _debugLogs.removeRange(100, _debugLogs.length);
+      if (mounted) setState(() {});
+      debugPrint(msg);
+    } catch (_) {}
+  }
 
   @override
   void initState() {
@@ -963,16 +976,23 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
   }
 
   Future<void> _setup() async {
+    _addDebug('>> _setup START');
+
     // 1. Determinar la URL y el tipo de stream
     if (widget.raw) {
       _videoUrl = _ensureHttpSafe(widget.camera.url);
       _useMjpegHtml = false;
       _useFallback = true;
       // En modo raw no probamos autenticación
+      _addDebug('raw mode -> videoUrl=$_videoUrl');
     } else {
+      _addDebug('calling _determineStreamType()');
       await _determineStreamType();
 
+      _addDebug('after _determineStreamType -> isLocked=$isLocked useMjpeg=$_useMjpegHtml useFallback=$_useFallback video=$_videoUrl');
+
       if (isLocked) {
+        _addDebug('isLocked -> requires auth, aborting setup');
         if (mounted) setState(() {});
         return;
       }
@@ -988,32 +1008,47 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
         // User Agent de Safari en iPhone para saltar bloqueos de Apple
         _webController.setUserAgent(
             "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1");
+        _addDebug('set UA: iOS Safari-like');
       } else if (defaultTargetPlatform == TargetPlatform.android) {
         // User Agent de Chrome en Android (tu Redmi K20 Pro)
         _webController.setUserAgent(
             "Mozilla/5.0 (Linux; Android 11; Redmi K20 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36");
+        _addDebug('set UA: Android Chrome-like');
       } else {
         // User Agent genérico para otros sistemas
         _webController.setUserAgent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36");
+        _addDebug('set UA: generic desktop-like');
       }
     } catch (e) {
       debugPrint("Error configurando UserAgent: $e");
+      _addDebug('error setting UA: $e');
     }
 
     // 4. Único NavigationDelegate (Fusión de logs de error + limpieza de JS)
     _webController.setNavigationDelegate(NavigationDelegate(
       onPageStarted: (url) {
+        _addDebug('onPageStarted: ${url ?? ''}');
         _onPageStarted();
       },
       onPageFinished: (url) async {
+        _addDebug('onPageFinished: ${url ?? ''}');
         // Inyectamos el limpiador de CSS/JS para quitar menús de la cámara
         await _injectCleaner();
         _onPageFinished();
       },
       onWebResourceError: (WebResourceError error) {
         // LOG CRÍTICO: Aquí verás en la consola de Codemagic por qué falla en iPhone
-        debugPrint("❌ Error WebView: ${error.description} | Código: ${error.errorCode} | URL: ${error.url}");
+        final descr = error.description ?? '';
+        final code = error.errorCode;
+        String url = '';
+        try {
+          url = (error as dynamic).failingUrl ?? (error as dynamic).url ?? '';
+        } catch (_) {
+          url = '';
+        }
+        debugPrint("❌ Error WebView: $descr | Código: $code | URL: $url");
+        _addDebug('WebView ERROR: $descr | code=$code | url=$url');
         
         if (mounted) {
           setState(() => _pageLoading = false);
@@ -1035,11 +1070,14 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
         </body>
       </html>
       ''';
+      _addDebug('loading MJPEG HTML with $_videoUrl');
       _webController.loadHtmlString(html);
     } else {
+      _addDebug('loading URL request: $_videoUrl');
       _webController.loadRequest(Uri.parse(_videoUrl));
     }
 
+    _addDebug('<< _setup END');
     if (mounted) setState(() {});
   }
 
@@ -1129,6 +1167,8 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
 
     void addAll(List<String> items){ for(var s in items) if(!candidates.contains(s)) candidates.add(s); }
 
+    _addDebug('determineStreamType base=$base');
+
     // Prioritize known good routes before brand-specific heuristics
     addAll([
       '/viewer/live/es/live.html',
@@ -1168,6 +1208,7 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
     } catch (_) {}
 
     // Probe candidates in order with short timeout
+    _addDebug('candidates (${candidates.length}): ${candidates.join(', ')}');
     for (var path in candidates) {
       String probeUrl;
       try {
@@ -1195,11 +1236,13 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
 
       _videoUrl = probeUrl;
       try {
+        _addDebug('probing -> $probeUrl');
         final uri = Uri.parse(probeUrl);
         final resp = await http.get(uri).timeout(const Duration(seconds: 2));
         final code = resp.statusCode;
         final contentType = (resp.headers['content-type'] ?? '').toLowerCase();
         final body = resp.body.toLowerCase();
+        _addDebug('probe result -> $probeUrl status=$code content-type=$contentType bodyLen=${resp.body.length}');
 
         if (code == 401) {
           isLocked = true;
@@ -1242,6 +1285,7 @@ class _CameraPlayerScreenState extends State<CameraPlayerScreen> {
         }
       } catch (e) {
         // timed out or network error -> try next
+        _addDebug('probe error for $probeUrl: $e');
         continue;
       }
     }
@@ -1577,6 +1621,40 @@ if(imgs && imgs.length>0){
                         child: const Text('Conectar'),
                       ),
                       const SizedBox(height: 8),
+
+                // Debug overlay (toggleable)
+                if (_showDebugOverlay)
+                  Positioned(
+                    left: 8,
+                    top: 8,
+                    child: GestureDetector(
+                      onLongPress: () {
+                        // long press to hide
+                        setState(() => _showDebugOverlay = false);
+                      },
+                      child: Container(
+                        width: 360,
+                        height: 220,
+                        decoration: BoxDecoration(color: Colors.black87.withOpacity(0.7), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.white24)),
+                        padding: const EdgeInsets.all(8),
+                        child: Column(children: [
+                          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                            const Text('DEBUG', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+                            IconButton(icon: const Icon(Icons.close, color: Colors.white70, size: 18), onPressed: () => setState(() => _showDebugOverlay = false))
+                          ]),
+                          const Divider(color: Colors.white12),
+                          Expanded(
+                            child: _debugLogs.isEmpty
+                                ? const Text('No logs', style: TextStyle(color: Colors.white54, fontSize: 12))
+                                : ListView.builder(
+                                    itemCount: _debugLogs.length,
+                                    itemBuilder: (ctx, i) => Text(_debugLogs[i], style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                                  ),
+                          ),
+                        ]),
+                      ),
+                    ),
+                  ),
                       TextButton(
                         onPressed: () => Navigator.of(context).pop(),
                         child: const Text('Volver', style: TextStyle(color: Colors.white70)),
